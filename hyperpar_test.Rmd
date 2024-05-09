@@ -1,0 +1,298 @@
+---
+title: ""
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    code_folding: hide
+    default_style: "light"
+    downcute_theme: "default"
+---
+
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = F, warning = F, message = F)
+
+library(INLA)
+library(ggplot2)
+library(dplyr)
+library(nowcaster)
+library(lubridate)
+library(patchwork)
+library(scoringutils)
+```
+
+## Modelo 
+$$
+Y_{i,t,d} \sim BNeg(\lambda_{i,t,d}), \ \ i = 1,2; \ \ t = 1, \dots, T; \ \ d = 1, \dots, D \\
+log(\lambda_{i,t,d}) = \alpha_i + \beta_{t,i} + \gamma_{d,i} + \delta_t + \psi_d
+$$
+
+A seguinte parametrização foi utilizada:
+
+$$
+P(Y = y) = {y + \phi -1 \choose y} \left(\frac{\mu}{\mu + \phi}\right)^y\left(\frac{\phi}{\mu + \phi}\right)^{\phi}
+$$
+Obs.:
+
+ - $Y_{1,t,d} \perp Y_{2,t,d} \ |\mathbf{\theta_{t,d}} \\$
+ 
+ 
+## Dados
+```{r}
+dados <- readRDS("Dados\\den_chik_2017_2019_RJ.RData")
+dados <- dados %>% janitor::clean_names()
+
+dados %>% 
+  filter(dt_sin_pri > ymd("2017-01-01")) %>% 
+  group_by(year(dt_sin_pri), epiweek(dt_sin_pri), arbo) %>% 
+  summarise(y = n(), date = min(dt_sin_pri)) %>%  
+  ggplot() +
+  aes(x = date, y = y, colour = arbo) +
+  geom_line() 
+```
+
+
+```{r, fig.width=10}
+## Guardando os dados reais
+data_real <- dados |>
+  filter(dt_sin_pri > ymd("2017-01-01")) |>
+  select(dt_digita, dt_sin_pri, arbo) |>
+  tidyr::drop_na(dt_digita) |>
+  mutate(delay = as.numeric(floor(difftime(dt_digita, dt_sin_pri, units = "weeks")))) |>
+  group_by(dt_sin_pri, delay, arbo)|>
+  summarise(y = n()) |>
+  ungroup() |>
+  mutate(epiweek = epiweek(dt_sin_pri), year = year(dt_sin_pri)) %>% 
+  group_by(year, epiweek, arbo) |>
+  summarise(y = sum(y), date = min(dt_sin_pri)) 
+
+
+data <- dados |>
+  filter(dt_sin_pri > ymd("2017-01-01")) |>
+  select(dt_digita, dt_sin_pri, arbo) |>
+  tidyr::drop_na(dt_digita) |>
+  mutate(delay = as.numeric(floor(difftime(dt_digita, dt_sin_pri, units = "weeks")))) |>
+  group_by(dt_sin_pri, delay, arbo)|>
+  summarise(y = n()) |>
+  filter(delay <= 15) 
+
+data |> 
+  ungroup() |>
+  filter(arbo == "Den") |>
+  mutate(epiweek = epiweek(dt_sin_pri), year = year(dt_sin_pri)) %>% 
+  group_by(year, epiweek, delay) |>
+  summarise(y = sum(y), date = min(dt_sin_pri)) |>
+  group_by(year, epiweek) |>
+  mutate(date = min(date)) |>
+  group_by(date) |>
+  summarise(y_real = cumsum(y), delay = delay) |>
+  #filter(delay %in% c(0,7,15)) |>
+ggplot() +
+  aes(x = date, y = y_real, col = factor(delay)) +
+  geom_line() +
+  scale_x_date(breaks = "8 weeks") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) -> g_deng
+
+data |> 
+  ungroup() |>
+  filter(arbo == "Chik") |>
+  mutate(epiweek = epiweek(dt_sin_pri), year = year(dt_sin_pri)) %>% 
+  group_by(year, epiweek, delay) |>
+  summarise(y = sum(y), date = min(dt_sin_pri)) |>
+  group_by(year, epiweek) |>
+  mutate(date = min(date)) |>
+  group_by(date) |>
+  summarise(y_real = cumsum(y), delay = delay) |>
+  #filter(delay %in% c(0,7,15)) |>
+ggplot() +
+  aes(x = date, y = y_real, col = factor(delay)) +
+  geom_line() +
+  scale_x_date(breaks = "8 weeks") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) -> g_chik
+
+g_deng + g_chik
+
+
+```
+
+
+```{r}
+data |>
+  ungroup() |>
+  mutate(epiweek = epiweek(dt_sin_pri), year = year(dt_sin_pri)) |>
+  group_by(epiweek, year, delay, arbo) |>
+  summarise(y = sum(y)) |> 
+  tidyr::pivot_wider(names_from = delay, values_from = y) |>
+  mutate_if(~is.numeric(.), ~coalesce(.,0)) |>
+  tidyr::pivot_longer(cols = 4:19, names_to = "delay", values_to = "y") |>
+  mutate(delay = as.numeric(delay)) |>
+  arrange(year, epiweek, delay) |> 
+  tidyr::pivot_wider(names_from = arbo, values_from = y) -> data 
+
+data %>% 
+  ungroup() %>% 
+  filter(year < 2019 | epiweek <= 20) %>% 
+  mutate(chik_obs = ifelse(epiweek + delay > 20 & year == 2019, NA, Chik),
+         den_obs = ifelse(epiweek + delay > 20 & year == 2019, NA, Den)) -> data_model
+```
+
+
+
+```{r}
+data_model %>% 
+  distinct(epiweek, year) %>% 
+  mutate(time = 1:n()) %>% 
+  inner_join(data_model, by = c("epiweek", "year")) -> data_model
+
+y_new <- data_model %>% 
+  mutate(report_time = time + delay) %>% 
+  select(time, delay, report_time, y1_obs = chik_obs, y2_obs = den_obs, y1 = Chik, y2 = Den)
+  
+
+y_df <- y_new
+```
+
+## Modelo Bivariado 
+
+```{r}
+n <- nrow(y_df)
+
+y_bvar <- matrix(NA, nrow = 2 * n, ncol = 2)
+y_bvar[1:n, 1] <- y_new$y1_obs
+y_bvar[n + 1:n, 2] <- y_new$y2_obs
+
+I <- matrix(NA, nrow = 2 * n, ncol = 2)
+I[1:n, 1] <- 1
+I[n + 1:n, 2] <- 1
+
+
+fixed_covariate = data.frame(alphai = as.factor(c(rep(1, n), rep(2, n))),
+                             id_time1 = c(rep(1,n), rep(NA, n)),
+                             id_delay1 = c(rep(1,n), rep(NA, n)),
+                             id_time2 = c(rep(NA, n), rep(1, n)),
+                             id_delay2 = c(rep(NA, n), rep(1, n)),
+                             idrep = rep(1:2, each = n))
+
+
+random_covariate <- list(time1  = c(y_df$time, rep(NA, n)),
+                         delay1 = c(y_df$delay, rep(NA, n)),
+                         time2  = c(rep(NA, n), y_df$time),
+                         delay2 = c(rep(NA, n), y_df$delay),
+                         time = rep(y_df$time, 2),
+                         delay = rep(y_df$delay, 2))
+
+
+Y = y_bvar
+joint_data <- cbind(Y, fixed_covariate, random_covariate)
+
+
+joint_model <- Y ~ -1 + alphai +
+  + f(time,  model = "rw2", replicate = idrep,
+      hyper = list(prec = list(param = c(0.001, 0.001)))) +
+  + f(delay, model = "rw1", replicate = idrep) +
+  + f(time1, model = "rw2") +
+  + f(time2, copy  = "time1", fixed = TRUE) + 
+  + f(delay1, model = "rw1") +
+  + f(delay2, copy  = "delay1", fixed = TRUE) 
+
+
+output0 <- INLA::inla(joint_model, family = rep("nbinomial", 2),
+                      data = joint_data,
+                      control.predictor = list(link = 1, compute = T),
+                      control.compute = list( config = T, waic=F, dic=F),
+                      control.family = list(
+                        list(hyper = list("theta" = list(prior = "loggamma", param = c(0.001, 0.001)))),
+                        list(hyper = list("theta" = list(prior = "loggamma", param = c(0.001, 0.0001))))
+                      )
+                      
+)
+```
+
+```{r}
+output0$summary.hyperpar|> 
+  knitr::kable() |> 
+  kableExtra::kable_styling()
+```
+
+
+## Análises univariadas
+
+### Chikungunya 
+```{r}
+dados_chik <- y_new %>% 
+  select(time, delay, report_time, Y = y1_obs, count = y1)
+
+
+model <- Y ~ 1 +
+  f(time,
+    model = "rw2",
+    hyper = list("prec" = list(prior = "loggamma",
+                               param = c(0.001, 0.001))
+    )) +
+  f(delay, model = "rw1",
+    hyper = list("prec" = list(prior = "loggamma",
+                               param = c(0.001, 0.001)))
+  )
+
+output_chik <- INLA::inla(model, family = "nbinomial",
+                          data = dados_chik,
+                          control.predictor = list(link = 1, compute = T),
+                          control.compute = list(config = T, waic=F, dic=F),
+                          control.family = list(
+                            hyper = list("theta" = list(prior = "loggamma",
+                                                        param = c(0.001,
+                                                                  0.001))
+                                         )
+                            )
+                          )
+
+output_chik$summary.hyperpar |> 
+  knitr::kable() |> 
+  kableExtra::kable_styling()
+```
+
+### Dengue 
+
+```{r}
+dados_deng <- y_new %>% 
+  select(time, delay, report_time, Y = y2_obs, count = y2)
+
+
+model <- Y ~ 1 +
+  f(time,
+    model = "rw2",
+    hyper = list("prec" = list(prior = "loggamma",
+                               param = c(0.001, 0.001))
+    )) +
+  f(delay, model = "rw1",
+    hyper = list("prec" = list(prior = "loggamma",
+                               param = c(0.001, 0.001)))
+  )
+
+output_deng <- INLA::inla(model, family = "nbinomial",
+                          data = dados_deng,
+                          control.predictor = list(link = 1, compute = T),
+                          control.compute = list(config = T, waic=F, dic=F),
+                          control.family = list(
+                            hyper = list("theta" = list(prior = "loggamma",
+                                                        param = c(0.001,
+                                                                  0.001))
+                                         )
+                            )
+                          )
+
+output_deng$summary.hyperpar|> 
+  knitr::kable() |> 
+  kableExtra::kable_styling()
+```
+
+
+ 
+
+ 
+ 
+ 

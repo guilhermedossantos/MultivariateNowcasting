@@ -1,0 +1,320 @@
+---
+title: "Teste poisson e NB bivariado"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    code_folding: hide
+    default_style: "light"
+    downcute_theme: "default"
+---
+
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = T, warning = F, message = F)
+
+library(INLA)
+library(ggplot2)
+library(dplyr)
+library(nowcaster)
+library(lubridate)
+library(patchwork)
+library(scoringutils)
+
+# Funções multivar nowcasting
+source("functions_multivar_nowcasting.R")
+```
+
+
+```{r}
+## Leitura e preparação de dados para o modelo
+dados <- readRDS("Dados\\den_chik_2017_2019_RJ.RData")
+dados <- dados %>% janitor::clean_names()
+
+dados |>
+  filter(dt_sin_pri > ymd("2017-01-01")) |>
+  select(dt_digita, dt_sin_pri, arbo) |> 
+  create_data(D = 15) |> 
+  model_data(max_year = 2019, max_epiweek = 20) -> data_model
+
+data_real <- dados |>
+  filter(dt_sin_pri > ymd("2017-01-01")) |>
+  select(dt_digita, dt_sin_pri, arbo) |> 
+  create_data(D = 15, return_data_real = T)
+
+
+```
+
+## RW(1) para delay e RW(2) para tempo
+
+```{r}
+## Modelo bivariado - binomial negativa
+inla_run_nb   <- run_inla_model(data_model, family = "nbinomial")
+output_nb     <- inla_run_nb$inla_output
+joint_data_nb <- inla_run_nb$joint_data
+
+test_sample_predictive_nb <- sample_predictive(inla_output = output_nb, 
+                                               joint_data = joint_data_nb)
+
+total_summary_nb <- bivar_nowcasting_summary(test_sample_predictive_nb)
+
+
+## Modelo bivariado - Poisson
+inla_run_pois  <- run_inla_model(data_model, family = "poisson")
+output_pois     <- inla_run_pois$inla_output
+joint_data_pois <- inla_run_pois$joint_data
+
+test_sample_predictive_pois <- sample_predictive(inla_output = output_pois, 
+                                                 joint_data = joint_data_pois,
+                                                 family = "poisson")
+
+total_summary_pois <- bivar_nowcasting_summary(test_sample_predictive_pois)
+
+```
+
+
+
+```{r, fig.width = 10, fig.height = 10}
+data_real %>% 
+  ungroup() %>% 
+  filter(year < 2019 | epiweek <= 20) %>% 
+  mutate(time = rep(unique(data_model$time), each = 2)) %>% 
+  tidyr::pivot_wider(names_from = "arbo", values_from = "y") %>% 
+  rename(y1 = Chik, y2 = Den) -> data_real
+
+## Gráficos correção - Binomial negativa
+total_summary_nb |> 
+  left_join(data_real, by = "time") |>
+  ggplot(aes(x = date, y = Median_y1, col = 'Nowcasting')) +
+  geom_line(data = data_real %>% filter(time > 100), 
+            aes(date, y = y1, col = 'Observed')) +
+  geom_ribbon(aes(ymin = LI_y1, ymax = LS_y1, col = NA), alpha = 0.2, show.legend = F) +
+  geom_line() +
+  labs(title = "Chikungunya - Negative Binomial") +
+  theme_bw() +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  scale_color_manual(values = c('grey50', 'black'), name = '')+
+  scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+
+  labs(x = '', y = 'Nº Cases') -> chik_correct_nb
+
+total_summary_nb |> 
+  left_join(data_real, by = "time") |>
+  ggplot(aes(x = date, y = Median_y2, col = 'Nowcasting')) +
+  geom_line(data = data_real %>% filter(time > 100), 
+            aes(date, y = y2, col = 'Observed')) +
+  geom_ribbon(aes(ymin = LI_y2, ymax = LS_y2, col = NA), alpha = 0.2, show.legend = F) +
+  geom_line() +
+  labs(title = "Dengue - Negative Binomial") +
+  theme_bw() +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  scale_color_manual(values = c('grey50', 'black'), name = '')+
+  scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+
+  labs(x = '', y = 'Nº Cases') -> dengue_correct_nb
+
+# Gráficos correção - Poisson
+total_summary_pois |> 
+  left_join(data_real, by = "time") |>
+  ggplot(aes(x = date, y = Median_y1, col = 'Nowcasting')) +
+  geom_line(data = data_real %>% filter(time > 100), 
+            aes(date, y = y1, col = 'Observed')) +
+  geom_ribbon(aes(ymin = LI_y1, ymax = LS_y1, col = NA), alpha = 0.2, show.legend = F) +
+  geom_line() +
+  labs(title = "Chikungunya - Poisson") +
+  theme_bw() +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  scale_color_manual(values = c('grey50', 'black'), name = '')+
+  scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+
+  labs(x = '', y = 'Nº Cases') -> chik_correct_pois
+
+total_summary_pois |> 
+  left_join(data_real, by = "time") |>
+  ggplot(aes(x = date, y = Median_y2, col = 'Nowcasting')) +
+  geom_line(data = data_real %>% filter(time > 100), 
+            aes(date, y = y2, col = 'Observed')) +
+  geom_ribbon(aes(ymin = LI_y2, ymax = LS_y2, col = NA), alpha = 0.2, show.legend = F) +
+  geom_line() +
+  labs(title = "Dengue - Poisson") +
+  theme_bw() +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  scale_color_manual(values = c('grey50', 'black'), name = '')+
+  scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+
+  labs(x = '', y = 'Nº Cases') -> dengue_correct_pois
+
+(chik_correct_nb + dengue_correct_nb) / (chik_correct_pois + dengue_correct_pois)
+
+```
+
+### Energy e Variogram Score
+```{r}
+library(scoringRules)
+
+# scores_pois
+# scores_nb
+
+# aaaa <- data_real |> filter(time >= 110)
+# 
+# energy_score_pois <- sapply(1:15,
+#                        function(i){
+#                          es_sample(aaaa[i,5:6] |>
+#                                      as.numeric(),
+#                                    test_sample_predictive_pois |>
+#                                      filter(time == 109 + i) %>%
+#                                      .[,c(3,4)] |>
+#                                      as.matrix() |> t())})
+# 
+# variogram_score_pois <- sapply(1:15,
+#                           function(i){
+#                             vs_sample(aaaa[i,5:6] |> as.numeric(),
+#                                       test_sample_predictive_pois |>
+#                                         filter(time == 109 + i) %>%
+#                                         .[,c(3,4)] |>
+#                                         as.matrix() |> t())})
+# 
+# 
+# energy_score_nb <- sapply(1:15,
+#                        function(i){
+#                          es_sample(aaaa[i,5:6] |>
+#                                      as.numeric(),
+#                                    test_sample_predictive_nb |>
+#                                      filter(time == 109 + i) %>%
+#                                      .[,c(3,4)] |>
+#                                      as.matrix() |> t())})
+# 
+# variogram_score_nb <- sapply(1:15,
+#                           function(i){
+#                             vs_sample(aaaa[i,5:6] |> as.numeric(),
+#                                       test_sample_predictive_nb |>
+#                                         filter(time == 109 + i) %>%
+#                                         .[,c(3,4)] |>
+#                                         as.matrix() |> t())})
+
+## data_real para entrar na função de energy e variogram score
+data_real <- data_real |> select(time, y1,y2)
+scores_nb <- scores_posterior(test_sample_predictive_nb, data_real)
+scores_pois <- scores_posterior(test_sample_predictive_pois, data_real)
+
+energy_score_nb <- scores_nb$energy_score
+energy_score_pois <- scores_pois$energy_score
+
+variogram_score_nb <- scores_nb$variogram_score
+variogram_score_pois <- scores_pois$variogram_score
+```
+
+```{r}
+ts.plot(energy_score_pois, main = "Energy score")
+lines(energy_score_nb, col = 2)
+legend("topleft", col = c(1,2), lty = 1, legend = c("Poisson", "Negative Binomial"))
+
+ts.plot(variogram_score_pois, main = "Variogram score")
+lines(variogram_score_nb, col = 2)
+legend("topleft", col = c(1,2), lty = 1, legend = c("Poisson", "Negative Binomial"))
+```
+
+### Métricas 
+```{r}
+### colocar metricas 
+rbind("NB" = selection_criteria(total_summary_nb, data_real,
+                         inla_run_nb$inla_output),
+      "Poisson" = selection_criteria(total_summary_pois, data_real,
+                         inla_run_pois$inla_output)) |> 
+  knitr::kable() |> 
+  kableExtra::kable_styling()
+```
+
+
+<!-- ## AR(1) para evolução dos parâmetros -->
+
+<!-- ```{r} -->
+<!-- ## Modelo bivariado - binomial negativa -->
+<!-- inla_run_nb   <- run_inla_model(data_model, family = "nbinomial", -->
+<!--                                 evol_time = "ar1", -->
+<!--                                 evol_delay = "ar1") -->
+<!-- output_nb     <- inla_run_nb$inla_output -->
+<!-- joint_data_nb <- inla_run_nb$joint_data -->
+
+<!-- test_sample_predictive_nb <- sample_predictive(inla_output = output_nb,  -->
+<!--                                                joint_data = joint_data_nb) -->
+
+<!-- total_summary_nb <- bivar_nowcasting_summary(test_sample_predictive_nb) -->
+
+
+<!-- ## Modelo bivariado - Poisson -->
+<!-- inla_run_pois  <- run_inla_model(data_model, family = "poisson", -->
+<!--                                 evol_time = "ar1", -->
+<!--                                 evol_delay = "ar1") -->
+<!-- output_pois     <- inla_run_pois$inla_output -->
+<!-- joint_data_pois <- inla_run_pois$joint_data -->
+
+<!-- test_sample_predictive_pois <- sample_predictive(inla_output = output_pois,  -->
+<!--                                                  joint_data = joint_data_pois, -->
+<!--                                                  family = "poisson") -->
+
+<!-- total_summary_pois <- bivar_nowcasting_summary(test_sample_predictive_pois) -->
+<!-- ``` -->
+
+
+<!-- ```{r, fig.width = 10, fig.height = 10} -->
+<!-- ## Gráficos correção - Binomial negativa -->
+<!-- total_summary_nb |>  -->
+<!--   left_join(data_real, by = "time") |> -->
+<!--   ggplot(aes(x = date, y = Median_y1, col = 'Nowcasting')) + -->
+<!--   geom_line(data = data_real %>% filter(time > 100),  -->
+<!--             aes(date, y = y1, col = 'Observed')) + -->
+<!--   geom_ribbon(aes(ymin = LI_y1, ymax = LS_y1, col = NA), alpha = 0.2, show.legend = F) + -->
+<!--   geom_line() + -->
+<!--   labs(title = "Chikungunya - Negative Binomial") + -->
+<!--   theme_bw() + -->
+<!--   theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) + -->
+<!--   scale_color_manual(values = c('grey50', 'black'), name = '')+ -->
+<!--   scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+ -->
+<!--   labs(x = '', y = 'Nº Cases') -> chik_correct_nb -->
+
+<!-- total_summary_nb |>  -->
+<!--   left_join(data_real, by = "time") |> -->
+<!--   ggplot(aes(x = date, y = Median_y2, col = 'Nowcasting')) + -->
+<!--   geom_line(data = data_real %>% filter(time > 100),  -->
+<!--             aes(date, y = y2, col = 'Observed')) + -->
+<!--   geom_ribbon(aes(ymin = LI_y2, ymax = LS_y2, col = NA), alpha = 0.2, show.legend = F) + -->
+<!--   geom_line() + -->
+<!--   labs(title = "Dengue - Negative Binomial") + -->
+<!--   theme_bw() + -->
+<!--   theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) + -->
+<!--   scale_color_manual(values = c('grey50', 'black'), name = '')+ -->
+<!--   scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+ -->
+<!--   labs(x = '', y = 'Nº Cases') -> dengue_correct_nb -->
+
+<!-- # Gráficos correção - Poisson -->
+<!-- total_summary_pois |>  -->
+<!--   left_join(data_real, by = "time") |> -->
+<!--   ggplot(aes(x = date, y = Median_y1, col = 'Nowcasting')) + -->
+<!--   geom_line(data = data_real %>% filter(time > 100),  -->
+<!--             aes(date, y = y1, col = 'Observed')) + -->
+<!--   geom_ribbon(aes(ymin = LI_y1, ymax = LS_y1, col = NA), alpha = 0.2, show.legend = F) + -->
+<!--   geom_line() + -->
+<!--   labs(title = "Chikungunya - Poisson") + -->
+<!--   theme_bw() + -->
+<!--   theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) + -->
+<!--   scale_color_manual(values = c('grey50', 'black'), name = '')+ -->
+<!--   scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+ -->
+<!--   labs(x = '', y = 'Nº Cases') -> chik_correct_pois -->
+
+<!-- total_summary_pois |>  -->
+<!--   left_join(data_real, by = "time") |> -->
+<!--   ggplot(aes(x = date, y = Median_y2, col = 'Nowcasting')) + -->
+<!--   geom_line(data = data_real %>% filter(time > 100),  -->
+<!--             aes(date, y = y2, col = 'Observed')) + -->
+<!--   geom_ribbon(aes(ymin = LI_y2, ymax = LS_y2, col = NA), alpha = 0.2, show.legend = F) + -->
+<!--   geom_line() + -->
+<!--   labs(title = "Dengue - Poisson") + -->
+<!--   theme_bw() + -->
+<!--   theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) + -->
+<!--   scale_color_manual(values = c('grey50', 'black'), name = '')+ -->
+<!--   scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+ -->
+<!--   labs(x = '', y = 'Nº Cases') -> dengue_correct_pois -->
+
+<!-- (chik_correct_nb + dengue_correct_nb) / (chik_correct_pois + dengue_correct_pois) -->
+<!-- ``` -->
+
+
+

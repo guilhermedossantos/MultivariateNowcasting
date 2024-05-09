@@ -1,0 +1,900 @@
+---
+title: ""
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    code_folding: hide
+    default_style: "light"
+    downcute_theme: "default"
+---
+
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = F, warning = F, message = F)
+
+library(INLA)
+library(ggplot2)
+library(dplyr)
+library(nowcaster)
+library(lubridate)
+library(patchwork)
+library(scoringutils)
+```
+
+<!-- ## Modelo  -->
+
+<!-- AINDA NÃO FUNCIONA -->
+
+<!-- $$ -->
+<!-- Y_{i,t,d} \sim Pois(\lambda_{i,t,d}), \ \ i = 1,2; \ \ t = 1, \dots, T; \ \ d = 1, \dots, D \\ -->
+<!-- log(\lambda_{i,t,d}) = \alpha_i + \beta_{t,i} + \gamma_{d,i} + \delta_t + \psi_d -->
+<!-- $$ -->
+
+<!-- A seguinte parametrização foi utilizada: -->
+
+<!-- $$ -->
+<!-- P(Y = y) = {y + \phi -1 \choose y} \left(\frac{\mu}{\mu + \phi}\right)^y\left(\frac{\phi}{\mu + \phi}\right)^{\phi} -->
+<!-- $$ -->
+<!-- Obs.: -->
+
+<!--  - $Y_{1,t,d} \perp Y_{2,t,d} \ |\mathbf{\theta_{t,d}} \\$ -->
+
+ 
+## Dados
+```{r}
+dados <- readRDS("Dados\\den_chik_2017_2019_RJ.RData")
+dados <- dados %>% janitor::clean_names()
+
+dados %>% 
+  filter(dt_sin_pri > ymd("2017-01-01")) %>% 
+  group_by(year(dt_sin_pri), epiweek(dt_sin_pri), arbo) %>% 
+  summarise(y = n(), date = min(dt_sin_pri)) %>%  
+  ggplot() +
+  aes(x = date, y = y, colour = arbo) +
+  geom_line() 
+```
+
+
+```{r, fig.width=10}
+## Guardando os dados reais
+data_real <- dados |>
+  filter(dt_sin_pri > ymd("2017-01-01")) |>
+  select(dt_digita, dt_sin_pri, arbo) |>
+  tidyr::drop_na(dt_digita) |>
+  mutate(delay = as.numeric(floor(difftime(dt_digita, dt_sin_pri, units = "weeks")))) |>
+  group_by(dt_sin_pri, delay, arbo)|>
+  summarise(y = n()) |>
+  ungroup() |>
+  mutate(epiweek = epiweek(dt_sin_pri), year = year(dt_sin_pri)) %>% 
+  group_by(year, epiweek, arbo) |>
+  summarise(y = sum(y), date = min(dt_sin_pri)) 
+
+
+data <- dados |>
+  filter(dt_sin_pri > ymd("2017-01-01")) |>
+  select(dt_digita, dt_sin_pri, arbo) |>
+  tidyr::drop_na(dt_digita) |>
+  mutate(delay = as.numeric(floor(difftime(dt_digita, dt_sin_pri, units = "weeks")))) |>
+  group_by(dt_sin_pri, delay, arbo)|>
+  summarise(y = n()) |>
+  filter(delay <= 15) 
+
+data |> 
+  ungroup() |>
+  filter(arbo == "Den") |>
+  mutate(epiweek = epiweek(dt_sin_pri), year = year(dt_sin_pri)) %>% 
+  group_by(year, epiweek, delay) |>
+  summarise(y = sum(y), date = min(dt_sin_pri)) |>
+  group_by(year, epiweek) |>
+  mutate(date = min(date)) |>
+  group_by(date) |>
+  summarise(y_real = cumsum(y), delay = delay) |>
+  #filter(delay %in% c(0,7,15)) |>
+ggplot() +
+  aes(x = date, y = y_real, col = factor(delay)) +
+  geom_line() +
+  scale_x_date(breaks = "8 weeks") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) -> g_deng
+
+data |> 
+  ungroup() |>
+  filter(arbo == "Chik") |>
+  mutate(epiweek = epiweek(dt_sin_pri), year = year(dt_sin_pri)) %>% 
+  group_by(year, epiweek, delay) |>
+  summarise(y = sum(y), date = min(dt_sin_pri)) |>
+  group_by(year, epiweek) |>
+  mutate(date = min(date)) |>
+  group_by(date) |>
+  summarise(y_real = cumsum(y), delay = delay) |>
+  #filter(delay %in% c(0,7,15)) |>
+ggplot() +
+  aes(x = date, y = y_real, col = factor(delay)) +
+  geom_line() +
+  scale_x_date(breaks = "8 weeks") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) -> g_chik
+
+g_deng + g_chik
+
+
+```
+
+
+```{r}
+data |>
+  ungroup() |>
+  mutate(epiweek = epiweek(dt_sin_pri), year = year(dt_sin_pri)) |>
+  group_by(epiweek, year, delay, arbo) |>
+  summarise(y = sum(y)) |> 
+  tidyr::pivot_wider(names_from = delay, values_from = y) |>
+  mutate_if(~is.numeric(.), ~coalesce(.,0)) |>
+  tidyr::pivot_longer(cols = 4:19, names_to = "delay", values_to = "y") |>
+  mutate(delay = as.numeric(delay)) |>
+  arrange(year, epiweek, delay) |> 
+  tidyr::pivot_wider(names_from = arbo, values_from = y) -> data 
+
+data %>% 
+  ungroup() %>% 
+  filter(year < 2019 | epiweek <= 20) %>% 
+  mutate(chik_obs = ifelse(epiweek + delay > 20 & year == 2019, NA, Chik),
+         den_obs = ifelse(epiweek + delay > 20 & year == 2019, NA, Den)) -> data_model
+```
+
+
+
+```{r}
+data_model %>% 
+  distinct(epiweek, year) %>% 
+  mutate(time = 1:n()) %>% 
+  inner_join(data_model, by = c("epiweek", "year")) -> data_model
+
+y_new <- data_model %>% 
+  mutate(report_time = time + delay) %>% 
+  select(time, delay, report_time, y1_obs = chik_obs, y2_obs = den_obs, y1 = Chik, y2 = Den)
+  
+
+y_df <- y_new
+```
+
+## Modelo Bivariado 
+
+```{r}
+n <- nrow(y_df)
+
+y_bvar <- matrix(NA, nrow = 2 * n, ncol = 2)
+y_bvar[1:n, 1] <- y_new$y1_obs
+y_bvar[n + 1:n, 2] <- y_new$y2_obs
+
+I <- matrix(NA, nrow = 2 * n, ncol = 2)
+I[1:n, 1] <- 1
+I[n + 1:n, 2] <- 1
+
+
+fixed_covariate = data.frame(alphai = as.factor(c(rep(1, n), rep(2, n))),
+                             id_time1 = c(rep(1,n), rep(NA, n)),
+                             id_delay1 = c(rep(1,n), rep(NA, n)),
+                             id_time2 = c(rep(NA, n), rep(1, n)),
+                             id_delay2 = c(rep(NA, n), rep(1, n)),
+                             idrep = rep(1:2, each = n))
+
+
+random_covariate <- list(time1  = c(y_df$time, rep(NA, n)),
+                         delay1 = c(y_df$delay, rep(NA, n)),
+                         time2  = c(rep(NA, n), y_df$time),
+                         delay2 = c(rep(NA, n), y_df$delay),
+                         time = rep(y_df$time, 2),
+                         delay = rep(y_df$delay, 2))
+
+
+Y = y_bvar
+joint_data <- cbind(Y, fixed_covariate, random_covariate)
+
+
+joint_model <- Y ~ -1 + alphai +
+  + f(time,  model = "ar1", replicate = idrep,
+      hyper = list(prec = list(param = c(0.001, 0.001)))) +
+  + f(delay, model = "ar1", replicate = idrep) +
+  + f(time1, model = "ar1") +
+  + f(time2, copy  = "time1", fixed = TRUE) + 
+  + f(delay1, model = "ar1") +
+  + f(delay2, copy  = "delay1", fixed = TRUE) 
+
+
+output0 <- INLA::inla(joint_model, family = rep("nbinomial", 2),
+                      data = joint_data,
+                      control.predictor = list(link = 1, compute = T),
+                      control.compute = list( config = T, waic=F, dic=F),
+                      control.family = list(
+                        list(hyper = list("theta" = list(prior = "loggamma", param = c(0.001, 0.001)))),
+                        list(hyper = list("theta" = list(prior = "loggamma", param = c(0.001, 0.0001))))
+                      )
+                      
+)
+```
+
+
+
+```{r}
+par(mfrow = c(1,2))
+vectime <- unique(y_new$time)
+ts.plot(output0$summary.random$time$`0.5quant`[vectime], 
+        main = "Efeito do tempo - Chikungunya")
+ts.plot(output0$summary.random$time$`0.5quant`[vectime + length(vectime)], 
+        main = "Efeito do tempo - Dengue")
+
+ts.plot(output0$summary.random$time1$`0.5quant`)
+ts.plot(output0$summary.random$time2$`0.5quant`)
+
+ts.plot(output0$summary.random$delay$`0.5quant`[1:16], xlab = "Delay", main = "Efeito do delay - Chikungunya")
+ts.plot(output0$summary.random$delay$`0.5quant`[17:32], xlab = "Delay", main = "Efeito do delay - Dengue")
+ts.plot(output0$summary.random$delay1$`0.5quant`, xlab = "Delay")
+ts.plot(output0$summary.random$delay2$`0.5quant`, xlab = "Delay")
+
+
+par(mfrow = c(1,1))
+ts.plot(output0$summary.random$delay1$`0.5quant` + output0$summary.random$delay$`0.5quant`[1:16], ylim = c(-1.6, 2.1), main = "Efeito do Delay (soma)", xlab = "Delay")
+lines(output0$summary.random$delay2$`0.5quant` + output0$summary.random$delay$`0.5quant`[17:32], col = 2)
+legend("topright", col = c(1,2), lty = c(1,1), legend = c("Chik", "Den"))
+
+
+ts.plot(output0$summary.random$time1$`0.5quant` + output0$summary.random$time$`0.5quant`[vectime], main = "Efeito do tempo (soma)")
+lines(output0$summary.random$time2$`0.5quant` + output0$summary.random$time$`0.5quant`[vectime + length(vectime)], col = 2)
+legend("topleft", col = c(1,2), lty = c(1,1), legend = c("Chik", "Den"))
+
+```
+
+
+## Amostragem da preditiva e nowcasting
+
+```{r}
+
+samples <- INLA::inla.posterior.sample(n = 1000, output0)
+
+
+
+index_missing <- which(is.na(joint_data$`1`) & is.na(joint_data$`2`))
+
+
+vector_samples_bvar <- lapply(X = samples,
+                              FUN = function(x, idx = index_missing, n = 1984){
+                                idx_1 <- idx[idx <= n]
+                                idx_2 <- idx[idx > n]
+                                unif.log = 1
+                                
+                                y1 <- stats::rnbinom(n = idx_1,
+                                                     mu = exp(x$latent[idx_1]),
+                                                     size = x$hyperpar[1]
+                                ) * unif.log
+                                
+                                y2 <- stats::rnbinom(n = idx_2,
+                                                     mu = exp(x$latent[idx_2]),
+                                                     size = x$hyperpar[2]
+                                ) * unif.log
+                                
+                                return(cbind(y1,y2))
+                              } )
+
+
+gg.age <- function(x, dados.gg, idx, n = 1984){
+  idx_1 <- idx[idx <= n]
+  idx_2 <- idx[idx > n]
+  data.aux <- dados.gg
+  Tmin <- min(dados.gg$time[idx])
+  data.aux$`1`[idx_1] <- x[,1]
+  data.aux$`2`[idx_2] <- x[,2]
+  data.aggregated <- data.aux |>
+    ## Selecionando apenas os dias faltantes a partir
+    ## do domingo da respectiva ultima epiweek
+    ## com dados faltantes
+    dplyr::filter(time >= Tmin  ) |>
+    dplyr::group_by(time) |>
+    dplyr::summarise(
+      Y1 = sum(`1`, na.rm = T), 
+      Y2 = sum(`2`, na.rm = T), .groups = "keep" 
+    )
+  data.aggregated
+}
+
+## Step 4: Applying the age aggregation on each posterior
+tibble.samples.0 <- lapply(X = vector_samples_bvar,
+                           FUN = gg.age,
+                           dados = joint_data,
+                           idx = index_missing)
+
+
+srag.pred.0 <- dplyr::bind_rows(tibble.samples.0, .id = "sample")
+
+total.summy <- srag.pred.0 |>
+  dplyr::group_by(time, sample) |>
+  dplyr::summarise(Y1 = sum(Y1, na.rm = T),
+                   Y2 = sum(Y2, na.rm = T)) |>
+  dplyr::group_by(time) |>
+  dplyr::summarise(Median_y1 = stats::median(Y1, na.rm = T),
+                   LI_y1  = stats::quantile(Y1, probs = 0.025, na.rm = T),
+                   LS_y1  = stats::quantile(Y1, probs = 0.975, na.rm = T),
+                   LIb_y1 = stats::quantile(Y1, probs = 0.25, na.rm = T),
+                   LSb_y1 = stats::quantile(Y1, probs = 0.75, na.rm = T),
+                   Median_y2 = stats::median(Y2, na.rm = T),
+                   LI_y2  = stats::quantile(Y2, probs = 0.025, na.rm = T),
+                   LS_y2  = stats::quantile(Y2, probs = 0.975, na.rm = T),
+                   LIb_y2 = stats::quantile(Y2, probs = 0.25, na.rm = T),
+                   LSb_y2 = stats::quantile(Y2, probs = 0.75, na.rm = T),
+                   .groups = "drop")
+
+
+
+dados_by_week <- y_new |>
+  group_by(time) |>
+  summarise(y1 = sum(y1, na.rm = T),
+            y2 = sum(y2, na.rm = T))
+
+summary_bivar <- total.summy
+```
+
+```{r}
+
+data_real %>% 
+  ungroup() %>% 
+  filter(year < 2019 | epiweek <= 20) %>% 
+  mutate(time = rep(unique(data_model$time), each = 2)) %>% 
+  tidyr::pivot_wider(names_from = "arbo", values_from = "y") %>% 
+  rename(y1 = Chik, y2 = Den) -> data_real
+
+total.summy |> 
+  left_join(data_real, by = "time") |>
+  ggplot(aes(x = date, y = Median_y1, col = 'Nowcasting')) +
+  geom_line(data = data_real %>% filter(time > 100), 
+            aes(date, y = y1, col = 'Observed')) +
+  geom_ribbon(aes(ymin = LI_y1, ymax = LS_y1, col = NA), alpha = 0.2, show.legend = F) +
+  geom_line() +
+  labs(title = "Chikungunya") +
+  theme_bw() +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  scale_color_manual(values = c('grey50', 'black'), name = '')+
+  scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+
+  labs(x = '', y = 'Nº Cases')
+
+
+total.summy |> 
+  left_join(data_real, by = "time") |>
+  ggplot(aes(x = date, y = Median_y2, col = 'Nowcasting')) +
+  geom_line(data = data_real %>% filter(time > 100), 
+            aes(date, y = y2, col = 'Observed')) +
+  geom_ribbon(aes(ymin = LI_y2, ymax = LS_y2, col = NA), alpha = 0.2, show.legend = F) +
+  geom_line() +
+  labs(title = "Dengue") +
+  theme_bw() +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  scale_color_manual(values = c('grey50', 'black'), name = '')+
+  scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+
+  labs(x = '', y = 'Nº Cases')
+
+total.summy |> 
+  left_join(data_real, by = "time") |>
+  ggplot(aes(x = time, y = Median_y2, col = 'Nowcasting')) +
+  geom_line(data = dados_by_week %>% filter(time > 100), 
+            aes(time, y = y2, col = 'Observed')) +
+  geom_ribbon(aes(ymin = LI_y2, ymax = LS_y2, col = NA), alpha = 0.2, show.legend = F) +
+  geom_line() +
+  labs(title = "Exemplo considerando somente até a 15° semana de atraso - Dengue") +
+  theme_bw() +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  scale_color_manual(values = c('grey50', 'black'), name = '')+
+  #scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+
+  labs(x = '', y = 'Nº Cases')
+
+
+```
+
+
+## Análises univariadas
+
+### Chikungunya 
+```{r}
+dados_chik <- y_new %>% 
+  select(time, delay, report_time, Y = y1_obs, count = y1)
+
+
+model <- Y ~ 1 +
+  f(time,
+    model = "ar1",
+    hyper = list("prec" = list(prior = "loggamma",
+                               param = c(0.001, 0.001))
+    )) +
+  f(delay, model = "ar1",
+    hyper = list("prec" = list(prior = "loggamma",
+                               param = c(0.001, 0.001)))
+  )
+
+output_chik <- INLA::inla(model, family = "nbinomial",
+                          data = dados_chik,
+                          control.predictor = list(link = 1, compute = T),
+                          control.compute = list(config = T, waic=F, dic=F),
+                          control.family = list(
+                            hyper = list("theta" = list(prior = "loggamma",
+                                                        param = c(0.001,
+                                                                  0.001))
+                                         )
+                            )
+                          )
+
+
+ts.plot(output0$summary.random$time1$`0.5quant` + output0$summary.random$time$`0.5quant`[vectime], main = "Efeito do tempo") #, ylim = c(-6, 9))
+lines(output_chik$summary.random$time$`0.5quant`, col = 2)#, ylim = c(-6, 9))
+legend("topleft", lty = 1, col = 1:2, legend = c("Bivariado", "Univariado"))
+
+ts.plot(output0$summary.random$delay1$`0.5quant` + output0$summary.random$delay$`0.5quant`[1:16], main = "Efeito do Delay", xlab = "Delay")
+lines(output_chik$summary.random$delay$`0.5quant`, col = 2)
+legend("topright", lty = 1, col = 1:2, legend = c("Bivariado", "Univariado"))
+
+```
+
+
+```{r}
+index.missing <- which(is.na(dados_chik$Y))
+
+
+## Step 1: Sampling from the approximate posterior distribution using INLA
+srag.samples0.list <- INLA::inla.posterior.sample(n = 1000, output_chik)
+
+## Give a parameter to trajectories, TO-DO
+
+## Step 2: Sampling the missing triangle from the likelihood using INLA estimates
+vector.samples0 <- lapply(X = srag.samples0.list,
+                          FUN = function(x, idx = index.missing){
+                            # if(zeroinflated){
+                            #   unif.log <- as.numeric(runif(idx,0,1) < x$hyperpar[2])
+                            # }else{
+                            unif.log = 1
+                            # }
+                            stats::rnbinom(n = idx,
+                                           mu = exp(x$latent[idx]),
+                                           size = x$hyperpar[1]
+                            ) * unif.log
+                          } )
+
+## Step 3: Calculate N_{a,t} for each triangle sample {N_{t,a} : t=Tactual-Dmax+1,...Tactual}
+
+gg.age <- function(x, dados.gg, idx){
+  data.aux <- dados.gg
+  Tmin <- min(dados.gg$time[idx])
+  data.aux$Y[idx] <- x
+  data.aggregated <- data.aux |>
+    ## Selecionando apenas os dias faltantes a partir
+    ## do domingo da respectiva ultima epiweek
+    ## com dados faltantes
+    dplyr::filter(time >= Tmin  ) |>
+    dplyr::group_by(time) |>
+    dplyr::summarise(
+      Y = sum(Y), .groups = "keep"
+    )
+  data.aggregated
+}
+
+## Step 4: Applying the age aggregation on each posterior
+tibble.samples.0 <- lapply( X = vector.samples0,
+                            FUN = gg.age,
+                            dados = dados_chik,
+                            idx = index.missing)
+
+srag.pred.0 <- dplyr::bind_rows(tibble.samples.0, .id = "sample")
+
+#return(srag.pred.0)
+
+
+
+total.summy <- srag.pred.0 |>
+  dplyr::group_by(time, sample) |>
+  dplyr::summarise(Y = sum(Y, na.rm = T)) |>
+  dplyr::group_by(time) |>
+  dplyr::summarise(Median = stats::median(Y, na.rm = T),
+                   LI = stats::quantile(Y, probs = 0.025, na.rm = T),
+                   LS = stats::quantile(Y, probs = 0.975, na.rm = T),
+                   LIb = stats::quantile(Y, probs = 0.25, na.rm = T),
+                   LSb = stats::quantile(Y, probs = 0.75, na.rm = T),
+                   .groups = "drop")
+
+
+output<- list()
+output$total <- total.summy
+
+summary_chik <- total.summy
+
+dados_by_week <- dados_chik |> 
+  group_by(time) |> 
+  summarise(n = sum(count, na.rm = T))
+
+output$total |> 
+  left_join(data_real, by = "time") |>
+  ggplot(aes(x = date, y = Median, col = 'Nowcasting')) +
+  geom_line(data = data_real %>% filter(time > 100), aes(date, y = y1, col = 'Observed')) +
+  geom_ribbon(aes(ymin = LI, ymax = LS, col = NA), alpha = 0.2, show.legend = F) +
+  geom_line() +
+  theme_bw() +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  scale_color_manual(values = c('grey50', 'black'), name = '')+
+  scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+
+  labs(x = '', y = 'Nº Cases')
+```
+
+### Dengue 
+
+```{r}
+dados_deng <- y_new %>% 
+  select(time, delay, report_time, Y = y2_obs, count = y2)
+
+
+model <- Y ~ 1 +
+  f(time,
+    model = "ar1",
+    hyper = list("prec" = list(prior = "loggamma",
+                               param = c(0.001, 0.001))
+    )) +
+  f(delay, model = "ar1",
+    hyper = list("prec" = list(prior = "loggamma",
+                               param = c(0.001, 0.001)))
+  )
+
+output_deng <- INLA::inla(model, family = "nbinomial",
+                          data = dados_deng,
+                          control.predictor = list(link = 1, compute = T),
+                          control.compute = list(config = T, waic=F, dic=F),
+                          control.family = list(
+                            hyper = list("theta" = list(prior = "loggamma",
+                                                        param = c(0.001,
+                                                                  0.001))
+                                         )
+                            )
+                          )
+
+ts.plot(output0$summary.random$time2$`0.5quant` + output0$summary.random$time$`0.5quant`[vectime + length(vectime)], main = "Efeito do tempo")
+lines(output_deng$summary.random$time$`0.5quant`, col = 2)
+legend("topleft", lty = 1, col = 1:2, legend = c("Bivariado", "Univariado"))
+
+
+ts.plot(output0$summary.random$delay2$`0.5quant` + output0$summary.random$delay$`0.5quant`[17:32],
+        main = "Efeito do Delay", xlab = "Delay")
+lines(output_deng$summary.random$delay$`0.5quant`, col = 2)
+legend("topright", lty = 1, col = 1:2, legend = c("Bivariado", "Univariado"))
+
+```
+
+
+```{r}
+index.missing <- which(is.na(dados_deng$Y))
+
+
+## Step 1: Sampling from the approximate posterior distribution using INLA
+srag.samples0.list <- INLA::inla.posterior.sample(n = 1000, output_deng)
+
+## Give a parameter to trajectories, TO-DO
+
+## Step 2: Sampling the missing triangle from the likelihood using INLA estimates
+vector.samples0 <- lapply(X = srag.samples0.list,
+                          FUN = function(x, idx = index.missing){
+                            # if(zeroinflated){
+                            #   unif.log <- as.numeric(runif(idx,0,1) < x$hyperpar[2])
+                            # }else{
+                            unif.log = 1
+                            # }
+                            stats::rnbinom(n = idx,
+                                           mu = exp(x$latent[idx]),
+                                           size = x$hyperpar[1]
+                            ) * unif.log
+                          } )
+
+## Step 3: Calculate N_{a,t} for each triangle sample {N_{t,a} : t=Tactual-Dmax+1,...Tactual}
+
+gg.age <- function(x, dados.gg, idx){
+  data.aux <- dados.gg
+  Tmin <- min(dados.gg$time[idx])
+  data.aux$Y[idx] <- x
+  data.aggregated <- data.aux |>
+    ## Selecionando apenas os dias faltantes a partir
+    ## do domingo da respectiva ultima epiweek
+    ## com dados faltantes
+    dplyr::filter(time >= Tmin  ) |>
+    dplyr::group_by(time) |>
+    dplyr::summarise(
+      Y = sum(Y), .groups = "keep"
+    )
+  data.aggregated
+}
+
+## Step 4: Applying the age aggregation on each posterior
+tibble.samples.0 <- lapply( X = vector.samples0,
+                            FUN = gg.age,
+                            dados = dados_deng,
+                            idx = index.missing)
+
+srag.pred.0 <- dplyr::bind_rows(tibble.samples.0, .id = "sample")
+
+
+total.summy <- srag.pred.0 |>
+  dplyr::group_by(time, sample) |>
+  dplyr::summarise(Y = sum(Y, na.rm = T)) |>
+  dplyr::group_by(time) |>
+  dplyr::summarise(Median = stats::median(Y, na.rm = T),
+                   LI = stats::quantile(Y, probs = 0.025, na.rm = T),
+                   LS = stats::quantile(Y, probs = 0.975, na.rm = T),
+                   LIb = stats::quantile(Y, probs = 0.25, na.rm = T),
+                   LSb = stats::quantile(Y, probs = 0.75, na.rm = T),
+                   .groups = "drop")
+
+
+output<- list()
+output$total <- total.summy
+
+summary_dengue <- total.summy
+
+dados_by_week <- dados_deng |> 
+  group_by(time) |> 
+  summarise(n = sum(count, na.rm = T))
+
+
+output$total |> 
+  left_join(data_real, by = "time") |>
+  ggplot(aes(x = date, y = Median, col = 'Nowcasting')) +
+  geom_line(data = data_real %>% filter(time > 100), aes(date, y = y2, col = 'Observed')) +
+  geom_ribbon(aes(ymin = LI, ymax = LS, col = NA), alpha = 0.2, show.legend = F) +
+  geom_line() +
+  theme_bw() +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  scale_color_manual(values = c('grey50', 'black'), name = '')+
+  scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+
+  labs(x = '', y = 'Nº Cases')
+```
+
+
+ - Dúvida: se a gente tá estimando até 15 semanas de atraso, é ok comparar com o dado real de mais de 15 semanas? Já que o intervalo é para o dado observado até a 15° semana de atraso, certo?
+ 
+ - Podemos fazer comparações mais espertas entre os efeitos estimados? Talvez pensando na distribuição em vez de somente na mediana?
+ 
+# Avaliando modelos
+
+## Dengue
+
+### Medidas de erro (usando a mediana como estimativa pontual)
+```{r}
+library(metrica)
+
+obs_dengue <- data_real %>% 
+  filter(time >= 110) %>% 
+  pull(y2)
+
+pred_dengue_uni <- summary_dengue$Median
+pred_dengue_biv <- summary_bivar$Median_y2
+
+cbind(metrics_summary(obs = obs_dengue, 
+                      pred = pred_dengue_uni, metrics_list = c("MAPE", "MAE", "MSE"),
+                      type= "regression"),
+      metrics_summary(obs = obs_dengue, 
+                      pred = pred_dengue_biv, metrics_list = c("MAPE", "MAE", "MSE"),
+                      type= "regression")) %>% 
+  knitr::kable(digits = 2) %>% 
+  kableExtra::kable_styling(full_width = F) %>% 
+  kableExtra::add_header_above(header = c("Univariado" = 2, "Bivariado" = 2))
+      
+
+plot_uni <- scatter_plot(obs = obs_dengue, 
+                         pred = pred_dengue_uni, 
+                         orientation = "PO",
+                         print_metrics = T,
+                         metrics_list = c("MAPE", "MAE", "MSE")
+                         ) + ggtitle("Univariado") + theme_light()
+
+plot_bi <- scatter_plot(obs = obs_dengue, 
+                         pred = pred_dengue_biv, 
+                         orientation = "PO",
+                         print_metrics = T,
+                         metrics_list = c("MAPE", "MAE", "MSE")
+                         ) + ggtitle("Bivariado") + theme_light()
+
+plot_uni + plot_bi
+```
+
+### Intervalos
+
+ - Ideia a fazer: olhar melhor para as preditivas 
+ 
+```{r}
+summary_dengue %>% 
+  mutate(Model = "Univariado") -> summary_dengue 
+
+summary_bivar %>% 
+  select(time, contains("_y2")) %>% 
+  mutate(Model = "Bivariado") -> bivar_dengue
+
+colnames(bivar_dengue) <- colnames(summary_dengue)
+
+dengue_models_summary <- bind_rows(summary_dengue, bivar_dengue) 
+
+dengue_models_summary %>% 
+  ggplot() +
+  aes(x = time, y = Median, ymin = LI, ymax = LS, col = Model) +
+  #ggdist::stat_pointinterval()
+  ggdist::geom_pointinterval(size = 2, position = position_dodge(width = .6)) 
+
+
+
+dengue_models_summary %>% 
+  mutate(int_size_95 = LS - LI,
+         int_size_50 = LSb - LIb) %>% 
+  group_by(Model) %>% 
+  summarise(mean_int_size_95 = mean(int_size_95),
+            mean_int_size_50 = mean(int_size_50))
+  
+dengue_models_summary %>% 
+  mutate(int_size_95 = LS - LI,
+         int_size_50 = LSb - LIb) %>% 
+  ggplot() +
+  aes(x = time, y = int_size_95, col = Model) +
+  geom_line(size = .8) +
+  labs(title = "Comprimento dos intervalos de 95% de credibilidade") +
+  theme_light() -> gg_int_90
+
+dengue_models_summary %>% 
+  mutate(int_size_95 = LS - LI,
+         int_size_50 = LSb - LIb) %>% 
+  ggplot() +
+  aes(x = time, y = int_size_50, col = Model) +
+  geom_line(size = .8) +
+  labs(title = "Comprimento dos intervalos de 50% de credibilidade") +
+  theme_light() -> gg_int_50
+
+
+gg_int_90 
+
+gg_int_50
+
+
+```
+
+
+### Interval score
+
+$score = (upper - lower) + \frac{2}{\alpha}(lower - true)*\mathbf{1}(true < lower) + \frac{2}{\alpha}(true - upper)*\mathbf{1}(true > upper)$
+
+```{r}
+
+dengue_models_summary |> 
+  mutate(score_95 = interval_score(true_values = rep(obs_dengue, 2), 
+                                   lower = LI, upper = LS, interval_range = 95),
+         score_50 = interval_score(true_values = rep(obs_dengue, 2), 
+                                   lower = LIb, upper = LSb, interval_range = 50)) -> dengue_models_summary
+
+
+dengue_models_summary |> 
+  ggplot() +
+  aes(x = time, y = score_95, colour = Model) +
+  geom_line(size = .8) +
+  labs(y = "Score para o intervalo de 95% de credibilidade",
+       colour = "Modelo") +
+  theme_light()
+```
+
+
+## Chikungunya
+
+### Medidas de erro (usando a mediana como estimativa pontual)
+
+```{r}
+obs_chik <- data_real %>% 
+  filter(time >= 110) %>% 
+  pull(y1)
+
+pred_chik_uni <- summary_chik$Median
+pred_chik_biv <- summary_bivar$Median_y1
+
+cbind(metrics_summary(obs = obs_chik, 
+                      pred = pred_chik_uni, metrics_list = c("MAPE", "MAE", "MSE"),
+                      type= "regression"),
+      metrics_summary(obs = obs_chik, 
+                      pred = pred_chik_biv, metrics_list = c("MAPE", "MAE", "MSE"),
+                      type= "regression")) %>% 
+  knitr::kable(digits = 2) %>% 
+  kableExtra::kable_styling(full_width = F) %>% 
+  kableExtra::add_header_above(header = c("Univariado" = 2, "Bivariado" = 2))
+      
+
+plot_uni <- scatter_plot(obs = obs_chik, 
+                         pred = pred_chik_uni, 
+                         orientation = "PO",
+                         print_metrics = T,
+                         metrics_list = c("MAPE", "MAE", "MSE")
+                         ) + ggtitle("Univariado") + theme_light()
+
+plot_bi <- scatter_plot(obs = obs_chik, 
+                         pred = pred_chik_biv, 
+                         orientation = "PO",
+                         print_metrics = T,
+                         metrics_list = c("MAPE", "MAE", "MSE")
+                         ) + ggtitle("Bivariado") + theme_light()
+
+plot_uni + plot_bi
+```
+
+### Intervalos
+
+ - Ideia a fazer: olhar melhor para as preditivas 
+ 
+```{r, fig.width=8}
+
+summary_chik %>% 
+  mutate(Model = "Univariado") -> summary_chik 
+
+summary_bivar %>% 
+  select(time, contains("_y1")) %>% 
+  mutate(Model = "Bivariado") -> bivar_chik
+
+colnames(bivar_chik) <- colnames(summary_chik)
+
+chik_models_summary <- bind_rows(summary_chik, bivar_chik) 
+
+chik_models_summary %>% 
+  ggplot() +
+  aes(x = time, y = Median, ymin = LI, ymax = LS, col = Model) +
+  ggdist::geom_pointinterval(size = 2, position = position_dodge(width = .6)) 
+
+
+
+chik_models_summary %>% 
+  mutate(int_size_95 = LS - LI,
+         int_size_50 = LSb - LIb) %>% 
+  group_by(Model) %>% 
+  summarise(mean_int_size_95 = mean(int_size_95),
+            mean_int_size_50 = mean(int_size_50))
+  
+chik_models_summary %>% 
+  mutate(int_size_95 = LS - LI,
+         int_size_50 = LSb - LIb) %>% 
+  ggplot() +
+  aes(x = time, y = int_size_95, col = Model) +
+  geom_line(size = .8) +
+  labs(title = "Comprimento dos intervalos de 95% de credibilidade") +
+  theme_light() -> gg_int_90
+
+chik_models_summary %>% 
+  mutate(int_size_95 = LS - LI,
+         int_size_50 = LSb - LIb) %>% 
+  ggplot() +
+  aes(x = time, y = int_size_50, col = Model) +
+  geom_line(size = .8) +
+  labs(title = "Comprimento dos intervalos de 50% de credibilidade") +
+  theme_light() -> gg_int_50
+
+gg_int_90 
+
+gg_int_50
+
+```
+
+
+### Interval score
+
+```{r}
+
+chik_models_summary |> 
+  mutate(score_95 = interval_score(true_values = rep(obs_chik, 2), 
+                                   lower = LI, upper = LS, interval_range = 95),
+         score_50 = interval_score(true_values = rep(obs_chik, 2), 
+                                   lower = LIb, upper = LSb, interval_range = 50)) -> chik_models_summary
+
+
+chik_models_summary |> 
+  ggplot() +
+  aes(x = time, y = score_95, colour = Model) +
+  geom_line(size = .8) +
+  labs(y = "Score para o intervalo de 95% de credibilidade",
+       colour = "Modelo") +
+  theme_light()
+```
+
+ 
+
+ 
+ 
+ 

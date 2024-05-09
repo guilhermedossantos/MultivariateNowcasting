@@ -1,0 +1,348 @@
+---
+title: "Teste com variável regressora"
+subtitle: "Dados Simulados - Apenas modelo bivar"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    highlight: kate
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = F)
+
+library(INLA)
+library(ggplot2)
+library(dplyr)
+library(nowcaster)
+library(truncnorm)
+
+```
+
+## Dados
+```{r}
+max_t <- 200
+D <- 15
+y <- matrix(NA, max_t + D, D)
+
+
+alpha_1 <- 1
+alpha_2 <- 0.5
+beta    <- matrix(nrow = max_t, ncol = 2)
+gamma_d <- matrix(nrow = D + 1, ncol = 2)
+delta   <- vector(length = max_t)
+psi     <- vector(length = D + 1)
+x <- vector(length = max_t)
+beta_x <- vector(length = max_t)
+
+
+set.seed(123)
+
+
+beta[1, ] <- rnorm(2)
+gamma_d[1,] <- rnorm(2, mean = 2)
+delta[1] <- rnorm(1)
+psi[1] <- rnorm(1)
+x[1] <- rnorm(1)
+beta_x[1] <- rnorm(1)
+
+
+tau_time <- 1000
+tau_time1 <- 200
+tau_delay <- 50
+tau_delay1 <- 5
+tau_beta_x <- 50
+tau_x <- 100
+
+# phi1 <- 0.4
+# phi52 <- 0.3
+
+# Geração dos efeitos/covariaveis
+for(t in 2:max_t){
+  # Efeitos do tempo (por doença e conjunto)
+  beta[t, ] <- rnorm(2, mean = beta[t-1, ], sd = sqrt(1/tau_time))
+  delta[t] <- rnorm(1, mean = delta[t-1], sd = sqrt(1/tau_time1))
+  
+  # Regressora e efeito da regressora
+  x[t] <- x[t-1] + rnorm(1, sd = sqrt(1/tau_x))
+  beta_x[t] <- beta_x[t-1] + rnorm(1, sd = sqrt(1/tau_beta_x))
+  
+  # if(t <= 52){
+  #   X[t] <- phi1*X[t-1] + rnorm(1, 0, sqrt(1/tau_param))
+  # }else{
+  #   X[t] <- phi1*(X[t-1]) + phi52*(X[t-52])  + rnorm(1, 0, sqrt(.25))
+  # }
+}
+
+for(d in 2:(D + 1)){
+  gamma_d[d, ] <- rtruncnorm(n = 1, mean = gamma_d[d-1, ], sd = sqrt(1/tau_delay),
+                             a = -Inf, b = gamma_d[d-1, ])
+
+  psi[d] <- rtruncnorm(n = 1, mean = psi[d - 1], sd = sqrt(1/tau_delay1),
+                       a = -Inf, b = psi[d - 1])
+  
+  # gamma_d[d, ] <- rnorm(n = 1, mean = gamma_d[d-1, ],
+  #                              sd = sqrt(1/tau_delay)) #,
+  #                            #a = -Inf, b = gamma_d[d-1, ])
+  # 
+  # psi[d] <- rnorm(n = 1, mean = psi[d - 1], sd = sqrt(1/tau_delay1))
+  
+}
+
+ts.plot(beta)
+ts.plot(gamma_d)
+ts.plot(delta)
+ts.plot(psi)
+ts.plot(x)
+ts.plot(beta_x)
+```
+
+
+```{r}
+input1 <- cbind(rep(alpha_1, max_t*(D+1)), 
+                rep(gamma_d[,1], max_t),
+                rep(beta[,1], each = D+1), 
+                rep(delta, each = D+1),
+                rep(psi, max_t), 
+                rep(beta_x*x, each = D+1))
+
+input2 <- cbind(rep(alpha_2, max_t*(D+1)), 
+                rep(gamma_d[,2], max_t),
+                rep(beta[,2], each = D+1), 
+                rep(delta, each = D+1),
+                rep(psi, max_t),
+                rep(beta_x*x, each = D+1))
+
+LP1 <- rowSums(input1)
+LP2 <- rowSums(input2)
+```
+
+```{r}
+# x = x/10
+```
+
+```{r}
+y <- cbind(rnbinom(n = (D+1)*max_t, size = 3, mu = exp(LP1)),
+           rnbinom(n = (D+1)*max_t, size = 3, mu = exp(LP2)))
+
+cor(LP1, LP2)
+cor(y)
+
+colnames(y) <- c("y1", "y2")
+
+
+y_df <- cbind.data.frame(y, 
+                         time = rep(1:max_t, each = D+1), 
+                         delay = rep(0:D, max_t)) %>% 
+  mutate(report_time = time + delay)
+
+y_df %>% 
+  group_by(time) %>% 
+  summarise(y1 = sum(y1),
+            y2 = sum(y2)) %>% 
+  select(-time) %>%
+  ts.plot()
+
+
+
+y_new <- y_df %>% 
+  mutate(y1_obs = ifelse(report_time > max_t, NA, y1),
+         y2_obs = ifelse(report_time > max_t, NA, y2))
+
+```
+
+
+## Modelo 
+
+```{r}
+n <- nrow(y)
+y_bvar <- matrix(NA, nrow = 2 * n, ncol = 2)
+y_bvar[1:n, 1] <- y_new$y1_obs
+y_bvar[n + 1:n, 2] <- y_new$y2_obs
+
+I <- matrix(NA, nrow = 2 * n, ncol = 2)
+I[1:n, 1] <- 1
+I[n + 1:n, 2] <- 1
+
+
+fixed_covariate = data.frame(alphai = as.factor(c(rep(1, n), rep(2, n))),
+                             id_time1 = c(rep(1,n), rep(NA, n)),
+                             id_delay1 = c(rep(1,n), rep(NA, n)),
+                             id_time2 = c(rep(NA, n), rep(1, n)),
+                             id_delay2 = c(rep(NA, n), rep(1, n)),
+                             idrep = rep(1:2, each = n),
+                             id_x = c(y_df$time, y_df$time),
+                             id_x1 = c(y_df$time, rep(NA,n)),
+                             id_x2 = c(rep(NA,n), y_df$time)) #rep(NA,n)))
+
+
+random_covariate <- list(time1  = c(y_df$time, rep(NA, n)),
+                         delay1 = c(y_df$delay, rep(NA, n)),
+                         time2  = c(rep(NA, n), y_df$time),
+                         delay2 = c(rep(NA, n), y_df$delay),
+                         time = rep(y_df$time, 2),
+                         delay = rep(y_df$delay, 2),
+                         x = rep(x, each = D + 1))
+
+
+
+
+Y = y_bvar
+joint_data <- cbind(Y, fixed_covariate, random_covariate)
+
+
+# Modeo considerando dois efeitos diferentes para a covariável.
+joint_model <- Y ~ -1 + alphai +
+  + f(time,  model = "rw1", replicate = idrep,
+      hyper = list(prec = list(param = c(0.001, 0.001)))) +
+  + f(delay, model = "rw1", replicate = idrep) +
+  + f(time1, model = "rw1") +
+  + f(time2, copy  = "time1", fixed = TRUE) + 
+  + f(delay1, model = "rw1") +
+  + f(delay2, copy  = "delay1", fixed = TRUE) +
+  + x + 
+  # + f(id_x, x, model = "rw1", replicate = idrep, 
+  #     hyper = list(prec = list(param = c(0.001, 0.001))), initial = 0) +
+  + f(id_x1, x, model = "rw1",
+      hyper = list(prec = list(param = c(0.001, 0.001))), initial = 0) +
+  + f(id_x2, x, copy = "id_x1", fixed = T)
+  
+
+teste_regressora <- INLA::inla(joint_model, family = rep("nbinomial", 2),
+                      data = joint_data,
+                      control.predictor = list(link = 1, compute = T),
+                      control.compute = list( config = T, waic=F, dic=F),
+                      control.family = list(
+                        list(hyper = list("theta" = list(prior = "loggamma", param = c(0.001, 0.001)))),
+                        list(hyper = list("theta" = list(prior = "loggamma", param = c(0.001, 0.0001))))
+                      ),
+                      verbose = F
+                      
+)
+
+summary(teste_regressora)
+
+#x11()
+
+
+```
+
+## Parâmetros
+
+#### Efeito da regressora (em torno da média)
+
+```{r}
+ts.plot(teste_regressora$summary.random$id_x1$`0.5quant`, ylim = c(-1.2,1.2))
+lines(teste_regressora$summary.random$id_x1$`0.975quant`, col = 2)
+lines(teste_regressora$summary.random$id_x1$`0.025quant`, col = 2)
+abline(h=0)
+lines(beta_x - mean(beta_x), col = "green")
+```
+
+
+#### Efeito do tempo (em torno da média)
+
+```{r}
+ts.plot(teste_regressora$summary.random$time$`0.5quant`, ylim = c(-1.6,1.6))
+lines(teste_regressora$summary.random$time$`0.975quant`, col = 2)
+lines(teste_regressora$summary.random$time$`0.025quant`, col = 2)
+abline(h=0)
+lines(c(beta[,1] - mean(beta[,1]), beta[,2] - mean(beta[,2])), col = "green")
+```
+
+#### Efeito comum do tempo 
+
+```{r}
+ts.plot(teste_regressora$summary.random$time1$`0.5quant`, ylim = c(-1,1))
+lines(teste_regressora$summary.random$time1$`0.975quant`, col = 2)
+lines(teste_regressora$summary.random$time1$`0.025quant`, col = 2)
+abline(h=0)
+lines(c(delta - mean(delta)), col = "green")
+```
+
+
+#### Efeito do delay (em torno da média)
+
+```{r}
+par(mfrow = c(1,2))
+ts.plot(teste_regressora$summary.random$delay$`0.5quant`[1:(D+1)],
+        ylim = c(-0.6,0.6), main = expression(gamma["1,d"]),
+        ylab = "", xlab = "d")
+lines(teste_regressora$summary.random$delay$`0.975quant`[1:(D+1)], col = 2)
+lines(teste_regressora$summary.random$delay$`0.025quant`[1:(D+1)], col = 2)
+abline(h=0)
+lines(c(gamma_d[,1] - mean(gamma_d[,1])), col = "green")
+
+
+ts.plot(teste_regressora$summary.random$delay$`0.5quant`[1:(D+1) + D], 
+        ylim = c(-0.6,0.6), main = expression(gamma["2,d"]),
+        ylab = "", xlab = "d")
+lines(teste_regressora$summary.random$delay$`0.975quant`[1:(D+1) + D], 
+      col = 2)
+lines(teste_regressora$summary.random$delay$`0.025quant`[1:(D+1) + D], 
+      col = 2)
+abline(h=0)
+lines(c(gamma_d[,2]- mean(gamma_d[,2])) , col = "green")
+```
+
+
+#### Delay conjunto
+
+```{r}
+ts.plot(teste_regressora$summary.random$delay1$`0.5quant`)
+lines(teste_regressora$summary.random$delay1$`0.975quant`, col = 2)
+lines(teste_regressora$summary.random$delay1$`0.025quant`, col = 2)
+abline(h=0)
+lines(c(psi) - mean(psi), col = "green")
+```
+
+## Nowcasting
+```{r}
+source("functions_multivar_nowcasting.R")
+pred_samples <- sample_predictive(inla_output = teste_regressora, joint_data = joint_data)
+
+summy <- bivar_nowcasting_summary(pred_samples)
+
+```
+
+```{r}
+
+# data_no_delay <- data_model |> 
+#    group_by(time) |> 
+#    summarise(y1_obs = sum(y1_obs, na.rm = T),
+#              y2_obs = sum(y2_obs, na.rm = T)) |> 
+#   left_join(data_real |> select(time, date))
+
+dados_by_week <- y_new |>
+  group_by(time) |>
+  summarise_at(vars(starts_with("y")), .funs = list(~sum(., na.rm = T)))
+
+
+summy |>
+  ggplot(aes(x = time, y = Median_y1, col = 'Nowcasting')) +
+  geom_line(data = dados_by_week %>% filter(time > 185), aes(time, y = y1, col = 'Observed')) +
+  geom_ribbon(aes(ymin = LI_y1, ymax = LS_y1, col = NA), alpha = 0.2, show.legend = F) +
+  geom_line() +
+  theme_bw() +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  scale_color_manual(values = c('grey50', 'black'), name = '')+
+  #scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+
+  labs(x = '', y = 'Nº Cases') 
+
+summy |>
+  ggplot(aes(x = time, y = Median_y2, col = 'Nowcasting')) +
+  geom_line(data = dados_by_week %>% filter(time > 185), aes(time, y = y2, col = 'Observed')) +
+  geom_ribbon(aes(ymin = LI_y2, ymax = LS_y2, col = NA), alpha = 0.2, show.legend = F) +
+  geom_line() +
+  theme_bw() +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  scale_color_manual(values = c('grey50', 'black'), name = '')+
+  #scale_x_date(date_breaks = '2 weeks', date_labels = '%V/%y', name = 'Date in Weeks')+
+  labs(x = '', y = 'Nº Cases') 
+
+
+```
+
+
+

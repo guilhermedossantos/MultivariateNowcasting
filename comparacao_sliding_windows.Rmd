@@ -1,0 +1,493 @@
+---
+title: ""
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    code_folding: hide
+    default_style: "light"
+    downcute_theme: "default"
+---
+
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = F, warning = F, message = F)
+
+library(INLA)
+library(ggplot2)
+library(dplyr)
+library(nowcaster)
+library(lubridate)
+library(patchwork)
+library(scoringutils)
+library(purrr)
+
+source("fit_predict_models.R")
+```
+
+
+## Dados
+```{r}
+dados <- readRDS("Dados\\den_chik_2017_2019_RJ.RData")
+dados <- dados %>% janitor::clean_names()
+
+dados %>% 
+  filter(dt_sin_pri > ymd("2017-01-01")) %>% 
+  group_by(year(dt_sin_pri), epiweek(dt_sin_pri), arbo) %>% 
+  summarise(y = n(), date = min(dt_sin_pri)) %>%  
+  ggplot() +
+  aes(x = date, y = y, colour = arbo) +
+  geom_line() +
+  theme_minimal()
+```
+
+
+```{r, fig.width=10}
+## Guardando os dados reais
+data_real <- dados |>
+  filter(dt_sin_pri > ymd("2017-01-01")) |>
+  select(dt_digita, dt_sin_pri, arbo) |>
+  tidyr::drop_na(dt_digita) |>
+  mutate(delay = as.numeric(floor(difftime(dt_digita, dt_sin_pri, units = "weeks")))) |>
+  group_by(dt_sin_pri, delay, arbo)|>
+  summarise(y = n()) |>
+  ungroup() |>
+  mutate(epiweek = epiweek(dt_sin_pri), year = year(dt_sin_pri)) %>% 
+  group_by(year, epiweek, arbo) |>
+  summarise(y = sum(y), date = min(dt_sin_pri)) 
+
+
+data <- dados |>
+  filter(dt_sin_pri > ymd("2017-01-01")) |>
+  select(dt_digita, dt_sin_pri, arbo) |>
+  tidyr::drop_na(dt_digita) |>
+  mutate(delay = as.numeric(floor(difftime(dt_digita, dt_sin_pri, units = "weeks")))) |>
+  group_by(dt_sin_pri, delay, arbo)|>
+  summarise(y = n()) |>
+  filter(delay <= 15) 
+```
+
+
+```{r}
+data |>
+  ungroup() |>
+  mutate(epiweek = epiweek(dt_sin_pri), year = year(dt_sin_pri)) |>
+  group_by(epiweek, year, delay, arbo) |>
+  summarise(y = sum(y)) |> 
+  tidyr::pivot_wider(names_from = delay, values_from = y) |>
+  mutate_if(~is.numeric(.), ~coalesce(.,0)) |>
+  tidyr::pivot_longer(cols = 4:19, names_to = "delay", values_to = "y") |>
+  mutate(delay = as.numeric(delay)) |>
+  arrange(year, epiweek, delay) |> 
+  tidyr::pivot_wider(names_from = arbo, values_from = y) -> data 
+
+
+data %>% 
+  ungroup() %>% 
+  filter(year < 2019 | epiweek <= 20) %>% 
+  mutate(chik_obs = ifelse(epiweek + delay > 20 & year == 2019, NA, Chik),
+         den_obs = ifelse(epiweek + delay > 20 & year == 2019, NA, Den)) -> data_model
+```
+
+
+
+```{r}
+maxtime <- ymd("2017-08-01") + weeks(1:125)
+
+
+purrr::map(maxtime, ~(
+  data %>% 
+  ungroup() %>% 
+  filter(year < year(.x) | epiweek <= epiweek(.x)) %>% 
+  filter(year <= year(.x)) %>% 
+  mutate(chik_obs = ifelse(epiweek + delay > epiweek(.x) & year == year(.x) , NA, Chik),
+         den_obs = ifelse(epiweek + delay > epiweek(.x) & year ==year(.x) , NA, Den))
+)) -> data_model_list
+
+
+purrr::map(maxtime, ~(
+  data_real %>% 
+  ungroup() %>% 
+  filter(year < year(.x) | epiweek <= epiweek(.x)) %>% 
+  filter(year <= year(.x)) %>% 
+  mutate(time = rep(1:(nrow(.)/2), each = 2)) %>%  # PODE DAR ERRO
+  tidyr::pivot_wider(names_from = "arbo", values_from = "y") %>% 
+  rename(y1 = Chik, y2 = Den)
+)) -> data_real_list
+
+```
+
+
+```{r}
+# escrever como função o ajuste do univariado e do bivariado talvez de forma que ja cuspa as métricas agregadas para os intervalos
+# ou uma função pra ajustar os modelos e outra pra avaliar, sei lá 
+
+data_model_compare <- data_model_list[seq(1,125, by = 10)]
+data_real_compare <- data_real_list[seq(1,125, by = 10)]
+
+```
+
+```{r}
+# bivar_fits <- map(data_model_compare, .f = fit_bivar)
+# uni_dengue_fits <- map(data_model_compare, .f = fit_uni,disease = "dengue")
+# uni_chik_fits <- map(data_model_compare, .f = fit_uni, disease = "chikungunya")
+```
+
+
+```{r}
+load("bivariado.RData")
+load("chik_univariado.RData")
+load("dengue_univariado.RData")
+
+bvdengue <- purrr::map2(bivar_fits, data_real_compare, calculate_score, disease = "dengue", bivar = T)
+bvchik <- purrr::map2(bivar_fits, data_real_compare, calculate_score, disease = "chik", bivar = T)
+unichik <- purrr::map2(uni_chik_fits, data_real_compare, calculate_score, disease = "chik", bivar = F)
+unidengue <- purrr::map2(uni_dengue_fits, data_real_compare, calculate_score, disease = "dengue", bivar = F)
+```
+
+## Avaliação dos modelos
+
+```{r}
+bvdengue |> 
+  map(~{. |> 
+          select(score_95:range_50) |> 
+          summarise_all(list(mean = mean,
+                             max = max,
+                             last = last))
+          }) |> 
+  bind_rows() -> metricas_bivar_dengue
+
+bvchik |> 
+  map(~{. |> 
+          select(score_95:range_50) |> 
+          summarise_all(list(mean = mean,
+                             max = max,
+                             last = last))
+          }) |> 
+  bind_rows() -> metricas_bivar_chik
+
+unichik |> 
+  map(~{. |> 
+          select(score_95:range_50) |> 
+          summarise_all(list(mean = mean,
+                             max = max,
+                             last = last))
+          }) |> 
+  bind_rows() -> metricas_uni_chik
+
+unidengue |> 
+  map(~{. |> 
+          select(score_95:range_50) |> 
+          summarise_all(list(mean = mean,
+                             max = max,
+                             last = last))
+          }) |> 
+  bind_rows() -> metricas_uni_dengue
+
+```
+
+
+```{r}
+metricas_bivar_chik |> 
+  bind_rows(metricas_uni_chik) |> 
+  mutate(modelo = rep(c("bivariado", "univariado"), each = 13)) -> metricas_chik
+
+metricas_bivar_dengue |> 
+  bind_rows(metricas_uni_dengue) |> 
+  mutate(modelo = rep(c("bivariado", "univariado"), each = 13)) -> metricas_dengue
+
+```
+
+### Métricas para o último intervalo
+
+#### Chikungunya 
+
+```{r}
+metricas_chik |> 
+  mutate(run = rep(1:13, 2)) |> 
+  ggplot() +
+  aes(x = run, y = score_95_last, col = modelo) +
+  geom_line(size = .8) +
+  labs(title = "Interval score para o último intervalo de 95% de credibilidade") +
+  theme_light() #-> gg_int_90
+
+metricas_chik |> 
+  mutate(run = rep(1:13, 2)) |> 
+  ggplot() +
+  aes(x = run, y = range_95_last, col = modelo) +
+  geom_line(size = .8) +
+  labs(title = "Tamanho do último intervalo de 95% de credibilidade") +
+  theme_light()
+
+ #
+```
+
+#### Dengue
+
+```{r}
+ #-> gg_int_90
+
+metricas_dengue |> 
+  mutate(run = rep(1:13, 2)) |> 
+  ggplot() +
+  aes(x = run, y = score_95_last, col = modelo) +
+  geom_line(size = .8) +
+  labs(title = "Interval score para o último intervalo de 95% de credibilidade") +
+  theme_light()
+
+metricas_dengue |> 
+  mutate(run = rep(1:13, 2)) |> 
+  ggplot() +
+  aes(x = run, y = range_95_last, col = modelo) +
+  geom_line(size = .8) +
+  labs(title = "Tamanho do último intervalo de 95% de credibilidade") +
+  theme_light()
+
+```
+
+### Média
+
+#### Chikungunya 
+
+```{r}
+metricas_chik |> 
+  mutate(run = rep(1:13, 2)) |> 
+  ggplot() +
+  aes(x = run, y = score_95_mean, col = modelo) +
+  geom_line(size = .8) +
+  labs(title = "Interval score médio para os intervalos de 95% de credibilidade") +
+  theme_light() #-> gg_int_90
+
+metricas_chik |> 
+  mutate(run = rep(1:13, 2)) |> 
+  ggplot() +
+  aes(x = run, y = range_95_mean, col = modelo) +
+  geom_line(size = .8) +
+  labs(title = "Tamanho médio dos intervalos de 95% de credibilidade") +
+  theme_light()
+
+ #
+```
+
+#### Dengue
+
+```{r}
+ #-> gg_int_90
+
+metricas_dengue |> 
+  mutate(run = rep(1:13, 2)) |> 
+  ggplot() +
+  aes(x = run, y = range_95_mean, col = modelo) +
+  geom_line(size = .8) +
+  labs(title = "Tamanho médio dos intervalos de 95% de credibilidade") +
+  theme_light()
+
+metricas_dengue |> 
+  mutate(run = rep(1:13, 2)) |> 
+  ggplot() +
+  aes(x = run, y = score_95_mean, col = modelo) +
+  geom_line(size = .8) +
+  labs(title = "Interval score médio para os intervalos de 95% de credibilidade") +
+  theme_light()
+```
+
+
+### Máximo
+
+#### Chikungunya 
+
+```{r}
+metricas_chik |> 
+  mutate(run = rep(1:13, 2)) |> 
+  ggplot() +
+  aes(x = run, y = score_95_max, col = modelo) +
+  geom_line(size = .8) +
+  labs(title = "Interval score máximo para os intervalos de 95% de credibilidade") +
+  theme_light() #-> gg_int_90
+
+metricas_chik |> 
+  mutate(run = rep(1:13, 2)) |> 
+  ggplot() +
+  aes(x = run, y = range_95_max, col = modelo) +
+  geom_line(size = .8) +
+  labs(title = "Tamanho máximo dos intervalos de 95% de credibilidade") +
+  theme_light()
+
+ #
+```
+
+#### Dengue 
+
+```{r}
+ #-> gg_int_90
+
+metricas_dengue |> 
+  mutate(run = rep(1:13, 2)) |> 
+  ggplot() +
+  aes(x = run, y = range_95_max, col = modelo) +
+  geom_line(size = .8) +
+  labs(title = "Tamanho máximo dos intervalos de 95% de credibilidade") +
+  theme_light()
+
+metricas_dengue |> 
+  mutate(run = rep(1:13, 2)) |> 
+  ggplot() +
+  aes(x = run, y = score_95_max, col = modelo) +
+  geom_line(size = .8) +
+  labs(title = "Interval score máximo para os intervalos de 95% de credibilidade") +
+  theme_light()
+```
+
+
+## Análise mais detalhada
+
+### Primeiro pico 
+
+ Dados até `r max(data_real_compare[[5]]$date)`
+
+#### Chikungunya
+
+```{r}
+chik_details_bv <- bvchik[[5]] |> 
+  select(-c(Median_y2:LSb_y2)) |> 
+  rename(Media = Median_y1) |> 
+  mutate(modelo = "bivariado")
+
+chik_details_uni <- unichik[[5]] |>
+  mutate(modelo = "univariado")
+
+chik_details <- chik_details_bv |> 
+  bind_rows(chik_details_uni)
+
+chik_details |> 
+ggplot() +
+  aes(x = time, y = score_95, colour = modelo) +
+  geom_line(size = .8) +
+  labs(y = "Score para o intervalo de 95% de credibilidade",
+       colour = "Modelo") +
+  theme_light()
+
+
+chik_details |> 
+ggplot() +
+  aes(x = time, y = range_95, colour = modelo) +
+  geom_line(size = .8) +
+  labs(y = "Score para o intervalo de 95% de credibilidade",
+       colour = "Modelo") +
+  theme_light()
+```
+
+
+#### Dengue 
+
+```{r}
+dengue_details_bv <- bvdengue[[5]] |> 
+  select(-c(Median_y1:LSb_y1)) |> 
+  rename(Media = Median_y2) |> 
+  mutate(modelo = "bivariado")
+
+dengue_details_uni <- unidengue[[5]] |>
+  mutate(modelo = "univariado")
+
+dengue_details <- dengue_details_bv |> 
+  bind_rows(dengue_details_uni)
+
+dengue_details |> 
+ggplot() +
+  aes(x = time, y = score_95, colour = modelo) +
+  geom_line(size = .8) +
+  labs(y = "Score para o intervalo de 95% de credibilidade",
+       colour = "Modelo") +
+  theme_light()
+
+
+dengue_details |> 
+ggplot() +
+  aes(x = time, y = range_95, colour = modelo) +
+  geom_line(size = .8) +
+  labs(y = "Score para o intervalo de 95% de credibilidade",
+       colour = "Modelo") +
+  theme_light()
+```
+
+
+### Segundo pico
+
+ Dados até `r max(data_real_compare[[11]]$date)`
+
+#### Chikungunya
+
+```{r}
+chik_details_bv <- bvchik[[11]] |> 
+  select(-c(Median_y2:LSb_y2)) |> 
+  rename(Media = Median_y1) |> 
+  mutate(modelo = "bivariado")
+
+chik_details_uni <- unichik[[11]] |>
+  mutate(modelo = "univariado")
+
+chik_details <- chik_details_bv |> 
+  bind_rows(chik_details_uni)
+
+chik_details |> 
+ggplot() +
+  aes(x = time, y = score_95, colour = modelo) +
+  geom_line(size = .8) +
+  labs(y = "Score para o intervalo de 95% de credibilidade",
+       colour = "Modelo") +
+  theme_light()
+
+
+chik_details |> 
+ggplot() +
+  aes(x = time, y = range_95, colour = modelo) +
+  geom_line(size = .8) +
+  labs(y = "Tamanho do intervalo de 95% de credibilidade",
+       colour = "Modelo") +
+  theme_light()
+```
+
+
+```{r}
+
+```
+
+
+#### Dengue 
+
+```{r}
+dengue_details_bv <- bvdengue[[11]] |> 
+  select(-c(Median_y1:LSb_y1)) |> 
+  rename(Media = Median_y2) |> 
+  mutate(modelo = "bivariado")
+
+dengue_details_uni <- unidengue[[11]] |>
+  mutate(modelo = "univariado")
+
+dengue_details <- dengue_details_bv |> 
+  bind_rows(dengue_details_uni)
+
+dengue_details |> 
+ggplot() +
+  aes(x = time, y = score_95, colour = modelo) +
+  geom_line(size = .8) +
+  labs(y = "Score para o intervalo de 95% de credibilidade",
+       colour = "Modelo") +
+  theme_light()
+
+
+dengue_details |> 
+ggplot() +
+  aes(x = time, y = range_95, colour = modelo) +
+  geom_line(size = .8) +
+  labs(y = "Tamanho do intervalo de 95% de credibilidade",
+       colour = "Modelo") +
+  theme_light()
+```
+
+
+
+
+
+
